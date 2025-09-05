@@ -410,12 +410,19 @@ int main(int argc, char* argv[]) {
 	//Create the directory to write the file to:
 	string global_dir = "global";
 	create_dir(global_dir);
-	//Complete the path to the file:
-	string filepath = global_dir + "/" + "global-stemma.dot";
-	//Then write to file:
+	// Find a unique filename to avoid overwriting
+	string base_filename = "global-stemma.dot";
+	string filepath = global_dir + "/" + base_filename;
+	int suffix = 1;
+	while (ifstream(filepath)) {
+		filepath = global_dir + "/global-stemma-" + to_string(suffix) + ".dot";
+		++suffix;
+	}
+	// Write to file
 	fstream dot_file;
 	dot_file.open(filepath, ios::out);
 	gs.to_dot(dot_file, print_lengths, flow_strengths);
 	dot_file.close();
+	cout << "Output written to: " << filepath << endl;
 	exit(0);
 }
