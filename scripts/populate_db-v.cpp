@@ -697,10 +697,32 @@ if (!excluded_variation_units.empty()) {
     for (const string & user_vu_id : excluded_variation_units) {
         excluded_vu_ids_user.insert(user_vu_id);
     }
-    // Report which variation units will be excluded
-    cout << "Excluding " << excluded_variation_units.size() << " variation units:" << endl;
-    for (const string & user_vu_id : excluded_vu_ids_user) {
-        cout << "  " << user_vu_id << endl;
+    // Check each ID against the units the collation actually has. An ID that is
+    // not there excludes nothing, and silently does so: a typo, a renamed unit
+    // and a unit already dropped upstream all look exactly like a successful
+    // exclusion in the unit count. Report what was matched, and say what was not.
+    set<string> present_vu_ids = set<string>();
+    for (variation_unit vu : app.get_variation_units()) {
+        present_vu_ids.insert(vu.get_id());
+    }
+    list<string> matched = list<string>();
+    list<string> unmatched = list<string>();
+    for (const string & vu_id : excluded_vu_ids_user) {
+        if (present_vu_ids.find(vu_id) != present_vu_ids.end()) {
+            matched.push_back(vu_id);
+        } else {
+            unmatched.push_back(vu_id);
+        }
+    }
+    cout << "Excluding " << matched.size() << " of " << present_vu_ids.size() << " variation units:" << endl;
+    for (const string & vu_id : matched) {
+        cout << "  " << vu_id << endl;
+    }
+    if (!unmatched.empty()) {
+        cerr << "Warning: " << unmatched.size() << " variation unit(s) given to -v are not in the collation and exclude nothing:" << endl;
+        for (const string & vu_id : unmatched) {
+            cerr << "  " << vu_id << endl;
+        }
     }
 }
 
