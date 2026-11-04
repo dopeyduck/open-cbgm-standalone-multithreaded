@@ -18,6 +18,7 @@
 #include <thread>
 #include <mutex>
 #include <chrono>
+#include <algorithm>
 
 #include "cxxopts.hpp"
 #include "pugixml.hpp"
@@ -478,6 +479,7 @@ int main(int argc, char* argv[]) {
 	set<string> trivial_reading_types = set<string>();
 	set<string> dropped_reading_types = set<string>();
 	list<string> ignored_suffixes = list<string>();
+	set<string> excluded_witnesses = set<string>();
 	bool merge_splits = false;
 	bool classic = false;
 	int threshold = 0;
@@ -485,7 +487,7 @@ int main(int argc, char* argv[]) {
 	string output_db_name = string();
 	try {
 		cxxopts::Options options("populate_db", "Parse the given collation XML file and populate the genealogical cache in the given SQLite database.");
-		options.custom_help("[-h] [-t threshold] [-z trivial_reading_type_1 -z trivial_reading_type_2 ...] [-Z dropped_reading_type_1 -Z dropped_reading_type_2 ...] [-s ignored_suffix_1 -s ignored_suffix_2 ...] [--merge-splits] [--classic] input_xml output_db");
+		options.custom_help("[-h] [-t threshold] [-z trivial_reading_type_1 -z trivial_reading_type_2 ...] [-Z dropped_reading_type_1 -Z dropped_reading_type_2 ...] [-s ignored_suffix_1 -s ignored_suffix_2 ...] [-e witness_1 -e witness_2 ...] [--merge-splits] [--classic] input_xml output_db");
 		options.positional_help("").show_positional_help();
 		options.add_options("")
 				("h,help", "print this help")
@@ -493,6 +495,7 @@ int main(int argc, char* argv[]) {
 				("z", "reading type to treat as trivial (this may be used multiple times)", cxxopts::value<vector<string>>())
 				("Z", "reading type to drop entirely (this may be used multiple times)", cxxopts::value<vector<string>>())
 				("s", "ignored witness siglum suffixes (e.g., *, T, V, f) to drop entirely (this may be used multiple times)", cxxopts::value<vector<string>>())
+				("e", "witnesses to exclude (e.g., ATEXT, THGNT, SBLGNT, NA28) (this may be used multiple times)", cxxopts::value<vector<string>>())
 				("merge-splits", "merge split attestations of the same reading", cxxopts::value<bool>())
 				("classic", "calculate explained readings and costs using classic CBGM rules", cxxopts::value<bool>());
 		options.add_options("positional")
@@ -522,6 +525,11 @@ int main(int argc, char* argv[]) {
 		if (args.count("s")) {
 			for (string ignored_suffix : args["s"].as<vector<string>>()) {
 				ignored_suffixes.push_back(ignored_suffix);
+			}
+		}
+		if (args.count("e")) {
+			for (string excluded_witness : args["e"].as<vector<string>>()) {
+				excluded_witnesses.insert(excluded_witness);
 			}
 		}
 		if (args.count("merge-splits")) {
@@ -557,14 +565,75 @@ int main(int argc, char* argv[]) {
 		exit(1);
 	}
 	apparatus app = apparatus(tei_node, merge_splits, trivial_reading_types, dropped_reading_types, ignored_suffixes);
+	
+	// DEBUG: Show initial witness count
+	cout << "DEBUG: Initial witness count: " << app.get_list_wit().size() << endl;
+	
+	// Filter out excluded witnesses if any were specified:
+	if (!excluded_witnesses.empty()) {
+		cout << "Excluding " << excluded_witnesses.size() << " witnesses:" << endl;
+		for (const string & excluded_wit : excluded_witnesses) {
+			cout << "  " << excluded_wit << endl;
+		}
+		
+		list<string> list_wit = app.get_list_wit();
+		list<string> actually_excluded;
+		
+		// Remove excluded witnesses and track which ones were actually present
+		list_wit.remove_if([&](const string & wit_id) {
+			if (excluded_witnesses.count(wit_id) > 0) {
+				actually_excluded.push_back(wit_id);
+				return true;
+			}
+			return false;
+		});
+		
+		app.set_list_wit(list_wit);
+		
+		if (!actually_excluded.empty()) {
+			cout << "Successfully excluded " << actually_excluded.size() << " witnesses from apparatus." << endl;
+		}
+		
+		// Report any excluded witnesses that weren't found
+		for (const string & excluded_wit : excluded_witnesses) {
+			if (find(actually_excluded.begin(), actually_excluded.end(), excluded_wit) == actually_excluded.end()) {
+				cout << "Warning: Excluded witness '" << excluded_wit << "' was not found in the apparatus." << endl;
+			}
+		}
+		
+		cout << "Remaining witnesses: " << list_wit.size() << endl;
+	}
+	
 	//If the user has specified a minimum extant readings threshold,
 	//then repopulate the apparatus's witness list with just the IDs of witnesses that meet the threshold:
 	if (threshold > 0) {
-		cout << "Filtering out fragmentary witnesses... " << endl;
+		cout << "Filtering out fragmentary witnesses with fewer than " << threshold << " extant readings..." << endl;
 		list<string> list_wit = app.get_list_wit();
+		
+		// Collect witnesses that will be filtered out
+		list<string> filtered_witnesses;
+		for (const string & wit_id : list_wit) {
+			int extant_count = app.get_extant_passages_for_witness(wit_id);
+			if (extant_count < threshold) {
+				filtered_witnesses.push_back(wit_id + " (" + to_string(extant_count) + " readings)");
+			}
+		}
+		
+		// Remove witnesses that don't meet the threshold
 		list_wit.remove_if([&](const string & wit_id) {
 			return app.get_extant_passages_for_witness(wit_id) < threshold;
 		});
+		
+		// Report which witnesses were filtered out
+		if (!filtered_witnesses.empty()) {
+			cout << "Filtered out " << filtered_witnesses.size() << " witnesses:" << endl;
+			for (const string & filtered_wit : filtered_witnesses) {
+				cout << "  " << filtered_wit << endl;
+			}
+		} else {
+			cout << "No witnesses were filtered out." << endl;
+		}
+		
 		app.set_list_wit(list_wit);
 	}
 	
@@ -572,6 +641,7 @@ int main(int argc, char* argv[]) {
 //Then initialize all of these witnesses:
 cout << "Initializing all witnesses (this may take a while)... " << endl;
 list<string> list_wit = app.get_list_wit();
+cout << "DEBUG: Final witness count before initialization: " << list_wit.size() << endl;
 vector<thread> threads;
 mutex mtx;
 
