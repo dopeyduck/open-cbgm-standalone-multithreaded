@@ -6,21 +6,22 @@
  */
 
 #ifdef _WIN32
-	#include <direct.h> //for Windows _mkdir() support
+#include <direct.h> //for Windows _mkdir() support
 #endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <iostream>
 #include <fstream>
-#include <cmath>
 #include <string>
 #include <list>
 #include <vector>
 #include <set>
 #include <unordered_map>
 #include <thread>
-#include <chrono>
-
+#include <chrono> 
+#include <atomic> 
+#include <mutex>  
+#include <iomanip> 
 #include "cxxopts.hpp"
 #include "roaring.hh"
 #include "sqlite3.h"
@@ -43,6 +44,7 @@ int create_dir(const string & dir) {
 		return mkdir(dir.c_str(), 0755);
 	#endif
 }
+
 
 /**
  * Retrieves all rows from the WITNESSES table of the given SQLite database
@@ -70,47 +72,9 @@ list<string> get_list_wit(sqlite3 * input_db, set<string> & excluded_wit_ids) {
 }
 
 /**
- * Retrieves all rows from the VARIATION_UNITS table of the given SQLite database
- * and returns a vector of variation unit labels populated with its contents.
+ * Using rows for the given witness ID from the GENEALOGICAL_COMPARISONS table of the given SQLite database,
+ * returns a witness.
  */
-vector<string> get_variation_unit_labels(sqlite3 * input_db) {
-	vector<string> variation_unit_labels = vector<string>();
-	int rc; //to store SQLite macros
-	sqlite3_stmt * select_from_variation_units_stmt;
-	sqlite3_prepare(input_db, "SELECT LABEL FROM VARIATION_UNITS ORDER BY ROW_ID", -1, & select_from_variation_units_stmt, 0);
-	rc = sqlite3_step(select_from_variation_units_stmt);
-	while (rc == SQLITE_ROW) {
-		string label = string(reinterpret_cast<const char *>(sqlite3_column_text(select_from_variation_units_stmt, 0)));
-		variation_unit_labels.push_back(label);
-		rc = sqlite3_step(select_from_variation_units_stmt);
-	}
-	sqlite3_finalize(select_from_variation_units_stmt);
-	return variation_unit_labels;
-}
-
-/**
- * Retrieves all rows from the GENEALOGICAL_COMPARISONS table of the given SQLite database
- * and adds the IDs of all witnesses extant at fewer than the given number of variation units to the given set of excluded witness IDs.
- */
-void add_fragmentary_witnesses_to_excluded_set(sqlite3 * input_db, const int min_extant, set<string> & excluded_wit_ids) {
-	int rc; //to store SQLite macros
-	sqlite3_stmt * select_from_genealogical_comparisons_stmt;
-	sqlite3_prepare(input_db, "SELECT * FROM GENEALOGICAL_COMPARISONS WHERE PRIMARY_WIT=SECONDARY_WIT ORDER BY ROW_ID", -1, & select_from_genealogical_comparisons_stmt, 0);
-	rc = sqlite3_step(select_from_genealogical_comparisons_stmt);
-	while (rc == SQLITE_ROW) {
-		string primary_wit_id = string(reinterpret_cast<const char *>(sqlite3_column_text(select_from_genealogical_comparisons_stmt, 1)));
-		int extant_bytes = sqlite3_column_bytes(select_from_genealogical_comparisons_stmt, 3);
-		const char * extant_buf = reinterpret_cast<const char *>(sqlite3_column_blob(select_from_genealogical_comparisons_stmt, 3));
-		Roaring extant = Roaring::readSafe(extant_buf, extant_bytes);
-		if (extant.cardinality() < min_extant) {
-			excluded_wit_ids.insert(primary_wit_id);
-		}
-		rc = sqlite3_step(select_from_genealogical_comparisons_stmt);
-	}
-	sqlite3_finalize(select_from_genealogical_comparisons_stmt);
-	return;
-}
-
 /**
  * Using rows for the given witness ID from the GENEALOGICAL_COMPARISONS table of the given SQLite database,
  * returns a witness.
@@ -177,6 +141,10 @@ witness get_witness(sqlite3 * input_db, const string & wit_id, set<string> & exc
  * Entry point to the script.
  */
 int main(int argc, char* argv[]) {
+	// Print the start date and time
+	auto script_start = std::chrono::system_clock::now();
+	time_t script_start_time = std::chrono::system_clock::to_time_t(script_start);
+	std::cout << "Script started at: " << std::put_time(std::localtime(&script_start_time), "%Y-%m-%d %H:%M:%S") << std::endl;
 	//Read in the command-line options:
 	set<string> excluded_wit_ids = set<string>();
 	float proportion_extant = 0.0;
@@ -248,10 +216,30 @@ int main(int argc, char* argv[]) {
 	//and add all witnesses below this threshold to the set of excluded witnesses:
 	if (proportion_extant > 0.0) {
 		cout << "Calculating minimum number of extant variation units..." << endl;
-		vector<string> vu_labels = get_variation_unit_labels(input_db);
-		int min_extant = (int) ceil(proportion_extant * vu_labels.size());
-		cout << "Adding fragmentary witnesses to exclusion set..." << endl;
-		add_fragmentary_witnesses_to_excluded_set(input_db, min_extant, excluded_wit_ids);
+		// Get number of variation units
+		int num_variation_units = 0;
+		sqlite3_stmt * stmt;
+		sqlite3_prepare(input_db, "SELECT COUNT(*) FROM VARIATION_UNITS", -1, &stmt, 0);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			num_variation_units = sqlite3_column_int(stmt, 0);
+		}
+		sqlite3_finalize(stmt);
+		int min_extant = (int) ceil(proportion_extant * num_variation_units);
+		// Add fragmentary witnesses to exclusion set
+		sqlite3_stmt * select_from_genealogical_comparisons_stmt;
+		sqlite3_prepare(input_db, "SELECT * FROM GENEALOGICAL_COMPARISONS WHERE PRIMARY_WIT=SECONDARY_WIT ORDER BY ROW_ID", -1, &select_from_genealogical_comparisons_stmt, 0);
+		int rc_frag = sqlite3_step(select_from_genealogical_comparisons_stmt);
+		while (rc_frag == SQLITE_ROW) {
+			string primary_wit_id = string(reinterpret_cast<const char *>(sqlite3_column_text(select_from_genealogical_comparisons_stmt, 1)));
+			int extant_bytes = sqlite3_column_bytes(select_from_genealogical_comparisons_stmt, 3);
+			const char * extant_buf = reinterpret_cast<const char *>(sqlite3_column_blob(select_from_genealogical_comparisons_stmt, 3));
+			Roaring extant = Roaring::readSafe(extant_buf, extant_bytes);
+			if (extant.cardinality() < min_extant) {
+				excluded_wit_ids.insert(primary_wit_id);
+			}
+			rc_frag = sqlite3_step(select_from_genealogical_comparisons_stmt);
+		}
+		sqlite3_finalize(select_from_genealogical_comparisons_stmt);
 	}
 	cout << "Retrieving witness list..." << endl;
 	//Retrieve all witness IDs (for non-excluded witnesses) in the order in which they occur in the table:
@@ -267,55 +255,174 @@ int main(int argc, char* argv[]) {
 		witness wit = get_witness(input_db, wit_id, excluded_wit_ids);
 		witnesses.push_back(wit);
 	}
+	// Track unfinished witnesses
+	std::set<std::string> unfinished_witnesses;
+	for (const witness& wit : witnesses) {
+		unfinished_witnesses.insert(wit.get_id());
+	}
 	//Close the database:
 	cout << "Closing database..." << endl;
 	sqlite3_close(input_db);
 	cout << "Database closed." << endl;
-	// Create a vector to hold the threads
-	vector<thread> threads;
-	// Define a lambda function to optimize the substemmata for a witness
-	auto optimize_substemmata = [](witness& wit) {
-		list<set_cover_solution> substemmata = wit.get_substemmata(0, true);
-		if (substemmata.empty()) {
-			return;
-		}
-		set_cover_solution substemma = substemmata.front();
-		list<string> stemmatic_ancestor_ids = list<string>();
-		for (set_cover_row row : substemma.rows) {
-			stemmatic_ancestor_ids.push_back(row.id);
-		}
-		wit.set_stemmatic_ancestor_ids(stemmatic_ancestor_ids);
-	};
 	cout << "Optimizing substemmata (this may take a moment)..." << endl;
-	auto start = chrono::high_resolution_clock::now();
-	// Create threads for each witness
-	for (witness& wit : witnesses) {
-		threads.emplace_back(optimize_substemmata, ref(wit));
+	
+	// Determine the number of threads to use (limited by CPU cores)
+	size_t max_threads = std::thread::hardware_concurrency();
+	if (max_threads == 0) {
+		max_threads = 4; // Fallback if hardware_concurrency() returns 0
+	}
+	cout << "Using " << max_threads << " threads (CPU cores available)" << endl;
+	
+	// Add these before the lambda function:
+	std::mutex progress_mutex;
+	std::mutex results_mutex;
+	size_t total_witnesses = witnesses.size();
+	std::atomic<size_t> progress_counter(0);
+	std::atomic<size_t> next_witness_index(0);
+	
+	// Vector to collect results from all threads
+	vector<pair<string, list<string>>> all_results;
+
+	// Define a lambda function to optimize the substemmata for a witness
+	// Profiling code is added to measure the time taken for each witness's substemmata optimization.
+	auto optimize_substemmata = [&]() {
+		// Thread-local storage for results
+		vector<pair<string, list<string>>> thread_results;
+		
+		while (true) {
+			// Get next witness to process
+			size_t current_index = next_witness_index.fetch_add(1);
+			if (current_index >= total_witnesses) {
+				break; 
+			}
+			
+			// Get reference to the witness at this index
+			auto it = witnesses.begin();
+			std::advance(it, current_index);
+			witness& wit = *it;
+			
+			// Start timing
+			auto start = std::chrono::high_resolution_clock::now();
+			list<set_cover_solution> substemmata = wit.get_substemmata();
+			auto end = std::chrono::high_resolution_clock::now();
+			std::chrono::duration<double> diff = end - start;
+			{
+				std::lock_guard<std::mutex> lock(progress_mutex);
+				auto finished_time = std::chrono::system_clock::now();
+				time_t finished_time_t = std::chrono::system_clock::to_time_t(finished_time);
+				std::cout << "\nWitness " << wit.get_id() << " substemmata time: " << diff.count() << " s ";
+				std::cout << "[" << std::put_time(std::localtime(&finished_time_t), "%Y-%m-%d %H:%M:%S") << "]" << std::endl;
+				// Remove processed witness
+				unfinished_witnesses.erase(wit.get_id());
+				if (unfinished_witnesses.size() == 20) {
+					std::cout << "\n20 witnesses left to process:\n";
+					for (const auto& id : unfinished_witnesses) {
+						std::cout << id << " ";
+					}
+					std::cout << std::endl;
+				}
+			}
+			if (substemmata.empty()) {
+				// Increment progress and print progress bar
+				size_t current_progress = ++progress_counter;
+				{
+					std::lock_guard<std::mutex> lock(progress_mutex);
+					int bar_width = 50;
+					float progress = float(current_progress) / float(total_witnesses);
+					std::cout << "[";
+					int pos = bar_width * progress;
+					for (int i = 0; i < bar_width; ++i) {
+						if (i < pos) std::cout << "=";
+						else if (i == pos) std::cout << ">";
+						else std::cout << " ";
+					}
+					std::cout << "] " << int(progress * 100.0) << "% ";
+					size_t unfinished = total_witnesses - current_progress;
+					std::cout << unfinished << " remaining. ";
+					std::cout << "Last finished: " << wit.get_id() << "\r";
+					std::cout.flush();
+				}
+				continue;
+			}
+			set_cover_solution substemma = substemmata.front();
+			list<string> stemmatic_ancestor_ids = list<string>();
+			for (set_cover_row row : substemma.rows) {
+				stemmatic_ancestor_ids.push_back(row.id);
+			}
+			// Store result locally instead of modifying witness directly
+			thread_results.push_back({wit.get_id(), stemmatic_ancestor_ids});
+			// Increment progress and print progress bar after processing is finished
+			size_t current_progress = ++progress_counter;
+			{
+				std::lock_guard<std::mutex> lock(progress_mutex);
+				int bar_width = 50;
+				float progress = float(current_progress) / float(total_witnesses);
+				std::cout << "[";
+				int pos = bar_width * progress;
+				for (int i = 0; i < bar_width; ++i) {
+					if (i < pos) std::cout << "=";
+					else if (i == pos) std::cout << ">";
+					else std::cout << " ";
+				}
+				std::cout << "] " << int(progress * 100.0) << "% ";
+				size_t unfinished = total_witnesses - current_progress;
+				std::cout << unfinished << " remaining. ";
+				std::cout << "Last finished: " << wit.get_id() << "\r";
+				std::cout.flush();
+			}
+		}
+		
+		// Add thread results to global results vector
+		{
+			std::lock_guard<std::mutex> lock(results_mutex);
+			all_results.insert(all_results.end(), thread_results.begin(), thread_results.end());
+		}
+	};
+
+	// Create a limited number of worker threads
+	vector<thread> threads;
+	for (size_t i = 0; i < max_threads; ++i) {
+		threads.emplace_back(optimize_substemmata);
 	}
 
 	// Wait for all threads to finish
 	for (thread& t : threads) {
 		t.join();
 	}
-	auto end = chrono::high_resolution_clock::now();
-	chrono::duration<double> diff = end - start;
-	long long total_seconds = chrono::duration_cast<chrono::seconds>(diff).count();
-	long long hours = total_seconds / 3600;
-	long long minutes = (total_seconds % 3600) / 60;
-	long long seconds = total_seconds % 60;
-	cout << "Finished optimizing substemmata in " << hours << " hours, " << minutes << " minutes, " << seconds << " seconds" << endl;
+	
+	// Apply all results sequentially to avoid thread safety issues
+	cout << "Applying substemmata results..." << endl;
+	for (const auto& result : all_results) {
+		const string& witness_id = result.first;
+		const list<string>& stemmatic_ancestor_ids = result.second;
+		
+		// Find the witness and apply the result
+		for (witness& wit : witnesses) {
+			if (wit.get_id() == witness_id) {
+				wit.set_stemmatic_ancestor_ids(stemmatic_ancestor_ids);
+				break;
+			}
+		}
+	}
 	cout << "Generating global stemma..." << endl;
 	//Construct the global stemma using the witnesses:
 	global_stemma gs = global_stemma(witnesses);
 	//Create the directory to write the file to:
 	string global_dir = "global";
 	create_dir(global_dir);
-	//Complete the path to the file:
-	string filepath = global_dir + "/" + "global-stemma.dot";
-	//Then write to file:
+	// Find a unique filename to avoid overwriting
+	string base_filename = "global-stemma.dot";
+	string filepath = global_dir + "/" + base_filename;
+	int suffix = 1;
+	while (ifstream(filepath)) {
+		filepath = global_dir + "/global-stemma-" + to_string(suffix) + ".dot";
+		++suffix;
+	}
+	// Write to file
 	fstream dot_file;
 	dot_file.open(filepath, ios::out);
 	gs.to_dot(dot_file, print_lengths, flow_strengths);
 	dot_file.close();
+	cout << "Output written to: " << filepath << endl;
 	exit(0);
 }
