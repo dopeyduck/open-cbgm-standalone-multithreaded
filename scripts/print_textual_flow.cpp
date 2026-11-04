@@ -13,10 +13,12 @@
 #include <iostream>
 #include <fstream>
 #include <cmath>
+#include <algorithm>
 #include <string>
 #include <list>
 #include <vector>
 #include <set>
+#include <map>
 #include <tuple>
 #include <unordered_map>
 #include <limits>
@@ -297,11 +299,13 @@ int main(int argc, char* argv[]) {
 	bool variants = false;
 	bool flow_strengths = false;
 	int connectivity = -1;
+	bool outline = false;
+	map<string, reading_color> rdg_colors = map<string, reading_color>();
 	set<string> filter_vu_ids = set<string>();
 	string input_db_name = string();
 	try {
 		cxxopts::Options options("print_textual_flow", "Prints multiple types of textual flow diagrams to .dot output files. The output files will be placed in the \"flow\", \"attestations\", and \"variants\" directories.");
-		options.custom_help("[-h] [-e wit_1 -e wit_2 ...] [-p proportion] [-k connectivity] [--flow] [--attestations] [--variants] [--strengths] input_db [passages]");
+		options.custom_help("[-h] [-e wit_1 -e wit_2 ...] [-p proportion] [-k connectivity] [-c rdg_1:color_1 -c rdg_2:color_2 ...] [--outline] [--flow] [--attestations] [--variants] [--strengths] input_db [passages]");
 		options.positional_help("").show_positional_help();
 		options.add_options("")
 				("h,help", "print this help")
@@ -311,6 +315,8 @@ int main(int argc, char* argv[]) {
 				("attestations", "print coherence in attestation textual flow diagrams", cxxopts::value<bool>())
 				("variants", "print coherence at variant passages diagrams (i.e., textual flow diagrams restricted to flow between different readings)", cxxopts::value<bool>())
 				("strengths", "format edges to reflect flow strengths", cxxopts::value<bool>())
+				("c,color", "color the nodes of the witnesses supporting a reading, as reading:color followed by any of an optional text color and the word fill or outline, separated by colons; a color is a graphviz color name or an #rrggbb hex value (which the shell will need quoted); may be given once per reading", cxxopts::value<vector<string>>())
+				("outline", "draw the colors given by -c as node outlines rather than fills, except where a -c argument says otherwise", cxxopts::value<bool>())
 				("k,connectivity", "desired connectivity limit (if not specified, default value in database is used)", cxxopts::value<int>());
 		options.add_options("positional")
 				("input_db", "genealogical cache database", cxxopts::value<string>())
@@ -354,6 +360,67 @@ int main(int argc, char* argv[]) {
 		//Parse the optional arguments:
 		if (args.count("strengths")) {
 			flow_strengths = args["strengths"].as<bool>();
+		}
+		if (args.count("outline")) {
+			outline = args["outline"].as<bool>();
+		}
+		if (args.count("c")) {
+			vector<string> color_args = args["c"].as<vector<string>>();
+			for (string color_arg : color_args) {
+				//Split the argument into its fields, accepting = as well as :,
+				//since both read naturally on a command line:
+				vector<string> fields = vector<string>();
+				size_t field_start = 0;
+				while (true) {
+					size_t field_end = color_arg.find_first_of(":=", field_start);
+					fields.push_back(color_arg.substr(field_start, field_end - field_start));
+					if (field_end == string::npos) {
+						break;
+					}
+					field_start = field_end + 1;
+				}
+				if (fields.size() < 2 || fields.size() > 4) {
+					cerr << "Error: the color argument " << color_arg << " is not of the form reading:color[:text][:fill|:outline]." << endl;
+					exit(1);
+				}
+				string rdg = fields[0];
+				reading_color rc;
+				rc.color = fields[1];
+				rc.font = string();
+				rc.outline = outline;
+				if (rdg.empty() || rc.color.empty()) {
+					cerr << "Error: the color argument " << color_arg << " has an empty reading or color." << endl;
+					exit(1);
+				}
+				//Of the remaining fields, the words fill and outline name the drawing mode;
+				//anything else is the color of the node's label:
+				bool mode_given = false;
+				bool font_given = false;
+				for (size_t i = 2; i < fields.size(); i++) {
+					string field = fields[i];
+					if (field == "fill" || field == "outline") {
+						if (mode_given) {
+							cerr << "Error: the color argument " << color_arg << " gives fill or outline more than once." << endl;
+							exit(1);
+						}
+						rc.outline = (field == "outline");
+						mode_given = true;
+					}
+					else if (field.empty() || font_given) {
+						cerr << "Error: the color argument " << color_arg << " is not of the form reading:color[:text][:fill|:outline]." << endl;
+						exit(1);
+					}
+					else {
+						rc.font = field;
+						font_given = true;
+					}
+				}
+				if (rdg_colors.find(rdg) != rdg_colors.end()) {
+					cerr << "Error: a color for reading " << rdg << " was given more than once." << endl;
+					exit(1);
+				}
+				rdg_colors[rdg] = rc;
+			}
 		}
 		if (args.count("k")) {
 			connectivity = args["k"].as<int>();
@@ -412,6 +479,21 @@ int main(int argc, char* argv[]) {
 		variation_unit vu = get_variation_unit(input_db, vu_id);
 		variation_units.push_back(vu);
 	}
+	//Check the colored readings against the readings that actually occur,
+	//so that a mistyped reading ID does not pass unnoticed:
+	for (pair<const string, reading_color> rdg_color : rdg_colors) {
+		bool rdg_occurs = false;
+		for (variation_unit vu : variation_units) {
+			list<string> readings = vu.get_readings();
+			if (find(readings.begin(), readings.end(), rdg_color.first) != readings.end()) {
+				rdg_occurs = true;
+				break;
+			}
+		}
+		if (!rdg_occurs) {
+			cerr << "Warning: no reading " << rdg_color.first << " occurs in the variation unit(s) being processed; the color given for it will not be used." << endl;
+		}
+	}
 	//If the minimum extant proportion option has been specified, 
 	//then count the number of variation units, calculate the minimum number of extant units from this,
 	//and add all witnesses below this threshold to the set of excluded witnesses:
@@ -455,7 +537,7 @@ int main(int argc, char* argv[]) {
 			//Then write to file:
 			fstream dot_file;
 			dot_file.open(filepath, ios::out);
-			tf.textual_flow_to_dot(dot_file, flow_strengths);
+			tf.textual_flow_to_dot(dot_file, flow_strengths, rdg_colors);
 			dot_file.close();
 		}
 		if (attestations) {
@@ -469,7 +551,7 @@ int main(int argc, char* argv[]) {
 				//Then write to file:
 				fstream dot_file;
 				dot_file.open(filepath, ios::out);
-				tf.coherence_in_attestations_to_dot(dot_file, rdg, flow_strengths);
+				tf.coherence_in_attestations_to_dot(dot_file, rdg, flow_strengths, rdg_colors);
 				dot_file.close();
 			}
 		}
@@ -482,7 +564,7 @@ int main(int argc, char* argv[]) {
 			//Then write to file:
 			fstream dot_file;
 			dot_file.open(filepath, ios::out);
-			tf.coherence_in_variant_passages_to_dot(dot_file, flow_strengths);
+			tf.coherence_in_variant_passages_to_dot(dot_file, flow_strengths, rdg_colors);
 			dot_file.close();
 		}
 	}
